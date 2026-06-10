@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Saphire</string>
+    <key>CFBundleDisplayName</key>
+    <string>Saphire</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jorge.saphire</string>
+    <key>CFBundleExecutable</key>
+    <string>Saphire</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Saphire lee tus correos desde Mail (solo lectura) para responder a tus preguntas sobre ellos.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Saphire usa el micrófono para dictar tus preguntas por voz manteniendo pulsado ⌥Espacio.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Saphire transcribe tu voz en el dispositivo para escribir tus preguntas mientras dictas.</string>
+</dict>
+</plist>

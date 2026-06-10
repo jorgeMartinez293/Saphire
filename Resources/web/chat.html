@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="vendor/hljs-dark.css">
+<style>
+  :root {
+    --bg: transparent;
+    --user-bg: linear-gradient(135deg, #7a71c2 0%, #5285cc 50%, #3499dd 100%);
+    --user-fg: #f2f6ff;
+    --asst-fg: #e6e8ea;
+    --muted: #8a9099;
+    --code-bg: #11161c;
+    --accent: #5aa2e8;
+    --hairline: rgba(255,255,255,0.10);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg);
+    color: var(--asst-fg);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    font-size: 14.5px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  body.compact { font-size: 13.5px; }
+  #root { padding: 10px 14px 18px; }
+  .msg { margin: 10px 0; display: flex; flex-direction: column; }
+  .msg.user { align-items: flex-end; }
+  /* Entry animation: only on first append (class removed on animationend), so
+     per-token rebuilds of the streaming bubble never re-trigger it. */
+  .msg.enter { animation: msg-in 0.28s cubic-bezier(0.21, 1, 0.36, 1); }
+  @keyframes msg-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+  /* User row: action buttons sit to the LEFT of the bubble, revealed on hover. */
+  .user-row { display: flex; flex-direction: row; align-items: center;
+    gap: 6px; justify-content: flex-end; max-width: 100%; }
+  .msg-actions { display: inline-flex; gap: 4px; flex-shrink: 0;
+    opacity: 0; transition: opacity 0.12s; }
+  .msg.user:hover .msg-actions, .msg-actions:focus-within { opacity: 1; }
+  .msg-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0;
+    color: var(--muted); background: none; border: none; cursor: pointer;
+    font-size: 14px; line-height: 1;
+    transition: color 0.12s;
+    -webkit-user-select: none; user-select: none;
+  }
+  .msg-btn:hover { color: var(--asst-fg); }
+  .bubble {
+    max-width: 88%; padding: 9px 13px; border-radius: 14px;
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  .user .bubble {
+    background: var(--user-bg); color: var(--user-fg); border-bottom-right-radius: 4px;
+    box-shadow: 0 2px 10px rgba(60, 130, 210, 0.22), inset 0 1px 0 rgba(255,255,255,0.14);
+  }
+  .assistant .bubble { background: transparent; padding-left: 2px; padding-right: 2px; max-width: 100%; }
+  .bubble p:first-child { margin-top: 0; }
+  .bubble p:last-child { margin-bottom: 0; }
+  .bubble pre {
+    background: var(--code-bg); padding: 11px 13px; border-radius: 10px;
+    overflow-x: auto; font-size: 0.86em;
+    border: 1px solid rgba(255,255,255,0.07);
+  }
+  .bubble a { color: var(--accent); text-decoration: none; }
+  .bubble a:hover { text-decoration: underline; }
+  .bubble blockquote {
+    margin: 8px 0; padding: 2px 0 2px 12px;
+    border-left: 3px solid rgba(255,255,255,0.18); color: var(--muted);
+  }
+  .bubble hr { border: none; height: 1px; background: var(--hairline); margin: 12px 0; }
+  .bubble code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+  .bubble :not(pre) > code {
+    background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 5px; font-size: 0.88em;
+  }
+  .code-wrap { position: relative; margin: 8px 0; }
+  .code-wrap pre { margin: 0; }
+  .copy-btn {
+    position: absolute; top: 6px; right: 6px;
+    display: inline-flex; align-items: center; gap: 4px;
+    font: 500 11px/1 -apple-system, system-ui, sans-serif;
+    color: var(--muted); background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+    padding: 4px 7px; cursor: pointer; opacity: 0;
+    transition: opacity 0.12s, color 0.12s, background 0.12s;
+    -webkit-user-select: none; user-select: none;
+  }
+  .code-wrap:hover .copy-btn, .copy-btn:focus { opacity: 1; }
+  .copy-btn:hover { color: var(--asst-fg); background: rgba(255,255,255,0.13); }
+  .copy-btn.copied { color: #6ee7a8; opacity: 1; }
+  /* Small language tag pinned top-left of a code block, fades in on hover
+     alongside the copy button. */
+  .code-lang {
+    position: absolute; top: 6px; left: 10px;
+    font: 500 10px/1 "SF Mono", ui-monospace, Menlo, monospace;
+    color: var(--muted); text-transform: lowercase; letter-spacing: 0.4px;
+    opacity: 0; transition: opacity 0.12s; pointer-events: none;
+  }
+  .code-wrap:hover .code-lang { opacity: 0.85; }
+  .bubble table { border-collapse: collapse; margin: 8px 0; }
+  .bubble th, .bubble td { border: 1px solid rgba(255,255,255,0.15); padding: 5px 9px; }
+  .bubble img.attachment {
+    max-width: 220px; max-height: 220px; border-radius: 10px; margin: 4px 6px 4px 0;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .thinking {
+    font-size: 0.85em; color: var(--muted); border-left: 2px solid rgba(255,255,255,0.18);
+    padding: 2px 0 2px 10px; margin: 4px 0; white-space: pre-wrap;
+    transition: border-color 0.15s;
+  }
+  .thinking:hover { border-left-color: rgba(255,255,255,0.32); }
+  .thinking summary { cursor: pointer; user-select: none; }
+  /* iMessage-style typing indicator shown before the first token arrives. */
+  .typing { display: inline-flex; gap: 4px; padding: 6px 2px; }
+  .typing span {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted);
+    animation: typing-pulse 1.2s ease-in-out infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.18s; }
+  .typing span:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes typing-pulse {
+    0%, 60%, 100% { opacity: 0.3; transform: scale(0.85); }
+    30%           { opacity: 1;   transform: scale(1); }
+  }
+  mjx-container { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
+  /* Minimalist marker showing which tool Saphire used. Full-width gray hairline
+     with a centered <slug:detail> label. */
+  .tool-mark {
+    display: flex; align-items: center; gap: 10px;
+    margin: 14px 0; color: var(--muted);
+    font: 500 11.5px/1.4 "SF Mono", ui-monospace, Menlo, monospace;
+    animation: msg-in 0.28s cubic-bezier(0.21, 1, 0.36, 1);
+  }
+  .tool-mark::before, .tool-mark::after {
+    content: ""; flex: 1; height: 1px; background: rgba(255,255,255,0.14);
+  }
+  .tool-mark span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; }
+</style>
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['$', '$'], ['\\(', '\\)']],
+      displayMath: [['$$', '$$'], ['\\[', '\\]']],
+      processEscapes: true
+    },
+    svg: { fontCache: 'global' },
+    startup: { typeset: false }
+  };
+</script>
+<script src="vendor/tex-svg.js" id="MathJax-script"></script>
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  marked.setOptions({ gfm: true, breaks: true });
+
+  // Pull math out before Markdown so marked can't mangle it, restore after.
+  function protectMath(src) {
+    const store = [];
+    const stash = (m) => { store.push(m); return "@@MJX" + (store.length - 1) + "@@"; };
+    src = src.replace(/\$\$([\s\S]+?)\$\$/g, stash);
+    src = src.replace(/\\\[([\s\S]+?)\\\]/g, stash);
+    src = src.replace(/\\\(([\s\S]+?)\\\)/g, stash);
+    src = src.replace(/(?<![\\\$])\$(?!\s)([^\$\n]+?)(?<!\s)\$(?!\d)/g, stash);
+    return { src, store };
+  }
+  function restoreMath(html, store) {
+    return html.replace(/@@MJX(\d+)@@/g, (_, i) => store[+i]);
+  }
+
+  function renderMarkdown(text) {
+    const { src, store } = protectMath(text || "");
+    let html = marked.parse(src);
+    return restoreMath(html, store);
+  }
+
+  // Clipboard write inside a WKWebView: prefer the async API, fall back to a
+  // hidden <textarea> + execCommand (reliable in WebView under a user gesture).
+  function fallbackCopy(text, done) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    ta.style.pointerEvents = "none";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); done(); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  function copyText(text, btn) {
+    const done = () => {
+      btn.textContent = "Copiado";
+      btn.classList.add("copied");
+      clearTimeout(btn._t);
+      btn._t = setTimeout(() => {
+        btn.textContent = "Copiar";
+        btn.classList.remove("copied");
+      }, 1400);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+    } else {
+      fallbackCopy(text, done);
+    }
+  }
+
+  // Wrap each code block and overlay a "Copiar" button that copies the raw
+  // code (the highlighted <code>'s textContent, sans markup). Wrapper keeps the
+  // button pinned top-right even when the <pre> scrolls horizontally.
+  function addCopyButtons(wrap) {
+    wrap.querySelectorAll("pre").forEach((pre) => {
+      const code = pre.querySelector("code");
+      if (!code) return;
+      if (pre.parentElement && pre.parentElement.classList.contains("code-wrap")) return;
+      const cw = document.createElement("div");
+      cw.className = "code-wrap";
+      pre.parentNode.insertBefore(cw, pre);
+      cw.appendChild(pre);
+      const langMatch = (code.className || "").match(/language-([\w+-]+)/);
+      if (langMatch && langMatch[1] !== "plaintext") {
+        const tag = document.createElement("span");
+        tag.className = "code-lang";
+        tag.textContent = langMatch[1];
+        cw.appendChild(tag);
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "copy-btn";
+      btn.textContent = "Copiar";
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        copyText(code.textContent, btn);
+      });
+      cw.appendChild(btn);
+    });
+  }
+
+  // Sticky autoscroll. Detaches the instant the user scrolls up (any amount)
+  // and re-attaches only when they return to the very bottom edge. Driven by
+  // user gestures (wheel/touch/keys), never by programmatic scroll or stream
+  // reflow -> no tug-of-war. The old 80px "near bottom" dead zone made small
+  // scrolls fight the auto-scroll, jittering between the last line and above.
+  let pinned = true;
+
+  function atBottom() {
+    return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 4);
+  }
+
+  // Upward intent from any input device -> detach immediately.
+  window.addEventListener("wheel", (e) => { if (e.deltaY < 0) pinned = false; }, { passive: true });
+
+  let touchY = null;
+  window.addEventListener("touchstart", (e) => {
+    touchY = e.touches.length ? e.touches[0].clientY : null;
+  }, { passive: true });
+  window.addEventListener("touchmove", (e) => {
+    if (touchY != null && e.touches.length && e.touches[0].clientY > touchY) pinned = false;
+    touchY = e.touches.length ? e.touches[0].clientY : null;
+  }, { passive: true });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") pinned = false;
+  }, { passive: true });
+
+  // Re-attach only when the user has genuinely scrolled back to the bottom.
+  window.addEventListener("scroll", () => { if (atBottom()) pinned = true; }, { passive: true });
+
+  // Signature: lets us skip rebuilding messages that did not change, so only
+  // the streaming (last) bubble is touched per token. Preserves DOM above the
+  // viewport -> scroll position stays put while user reads.
+  function msgSignature(m, isLast) {
+    return [m.role, m.content, m.thinking || "", (m.images || []).join("|"), isLast]
+      .join("");
+  }
+
+  // Send a per-bubble action (regenerate/edit) back to Swift.
+  function postAction(action, id) {
+    try {
+      window.webkit.messageHandlers.saphire.postMessage({ action: action, id: id });
+    } catch (e) {}
+  }
+
+  // Repetir / Editar buttons that live to the LEFT of a user bubble.
+  function buildUserActions(id) {
+    const box = document.createElement("div");
+    box.className = "msg-actions";
+    const mk = (action, glyph, title) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "msg-btn";
+      b.title = title;
+      b.textContent = glyph;
+      b.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        postAction(action, id);
+      });
+      return b;
+    };
+    box.appendChild(mk("regenerate", "↻", "Repetir esta pregunta"));
+    box.appendChild(mk("edit", "✎", "Editar esta pregunta"));
+    return box;
+  }
+
+  function buildBubble(m, isLast, actionsEnabled) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + m.role;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+
+    (m.images || []).forEach((src) => {
+      const img = document.createElement("img");
+      img.className = "attachment";
+      img.src = src;
+      bubble.appendChild(img);
+    });
+
+    if (m.thinking && m.thinking.trim()) {
+      const det = document.createElement("details");
+      det.className = "thinking";
+      const sum = document.createElement("summary");
+      sum.textContent = "razonamiento";
+      det.appendChild(sum);
+      const body = document.createElement("div");
+      body.textContent = m.thinking;
+      det.appendChild(body);
+      bubble.appendChild(det);
+    }
+
+    const content = document.createElement("div");
+    const streaming = isLast && m.role === "assistant" && m.content === "" && (!m.thinking);
+    if (m.content && m.content.length) {
+      content.innerHTML = renderMarkdown(m.content);
+    } else if (streaming) {
+      content.className = "typing";
+      for (let i = 0; i < 3; i++) content.appendChild(document.createElement("span"));
+    }
+    bubble.appendChild(content);
+
+    // User bubbles get Repetir / Editar to their left; assistant bubbles don't.
+    if (m.role === "user" && actionsEnabled) {
+      const row = document.createElement("div");
+      row.className = "user-row";
+      row.appendChild(buildUserActions(m.id));
+      row.appendChild(bubble);
+      wrap.appendChild(row);
+    } else {
+      wrap.appendChild(bubble);
+    }
+
+    wrap.querySelectorAll("pre code").forEach((el) => {
+      try { hljs.highlightElement(el); } catch (e) {}
+    });
+    addCopyButtons(wrap);
+    return wrap;
+  }
+
+  window.renderMessages = function (messages, compact, actionsEnabled) {
+    document.body.classList.toggle("compact", !!compact);
+    const root = document.getElementById("root");
+    const kids = root.children;
+
+    // Drop trailing elements no longer backed by a message.
+    while (kids.length > messages.length) root.removeChild(root.lastChild);
+
+    const changed = [];
+    messages.forEach((m, idx) => {
+      const isLast = idx === messages.length - 1;
+      const sig = msgSignature(m, isLast);
+      const existing = kids[idx];
+      if (existing && existing.dataset.sig === sig) return; // unchanged, keep DOM
+      const el = buildBubble(m, isLast, actionsEnabled);
+      el.dataset.sig = sig;
+      if (existing) {
+        root.replaceChild(el, existing);
+      } else {
+        el.classList.add("enter");
+        el.addEventListener("animationend", () => el.classList.remove("enter"), { once: true });
+        root.appendChild(el);
+      }
+      changed.push(el);
+    });
+
+    if (changed.length && window.MathJax && MathJax.typesetPromise) {
+      MathJax.typesetPromise(changed).catch(() => {});
+    }
+    if (pinned) window.scrollTo(0, document.body.scrollHeight);
+  };
+</script>
+</body>
+</html>
