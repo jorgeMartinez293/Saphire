@@ -291,6 +291,13 @@ private struct ToolsSettings: View {
                            help: "Listar y gestionar eventos del Calendario. La primera vez "
                                  + "macOS pedirá permiso.")
                 toolToggle("Tareas programadas (manage_scheduled_tasks)", isOn: $state.scheduleTaskToolEnabled)
+                toolToggle("Buscar archivos (search_files)", isOn: $state.searchFilesEnabled,
+                           help: "Localiza archivos por nombre o contenido con el índice "
+                                 + "de Spotlight. Solo lectura.")
+                toolToggle("Vigilantes (manage_watchers)", isOn: $state.watchdogEnabled,
+                           help: "Avisos automáticos cuando llega un correo o WhatsApp "
+                                 + "concreto. La comprobación periódica es local y no usa "
+                                 + "el modelo. Se gestionan en la pestaña Tareas.")
                 toolToggle("Guardar en memoria (remember_fact)", isOn: $state.rememberFactEnabled,
                            help: "Guarda datos persistentes entre conversaciones. Pedirá tu "
                                  + "confirmación antes de guardar nada.")
@@ -375,6 +382,37 @@ private struct SchedulesSettings: View {
                                + "recibir entradas (ratón/teclado) y no haya un vídeo o "
                                + "presentación manteniendo la pantalla encendida. La app debe "
                                + "seguir abierta.")
+                }
+            }
+
+            Section {
+                Toggle("Vigilancia activa", isOn: $state.watchdogEnabled)
+                if state.watchdogEnabled {
+                    Stepper(value: $state.watchdogMinutes, in: 1...60) {
+                        HStack {
+                            Text("Comprobar cada")
+                            Spacer()
+                            Text("\(state.watchdogMinutes) min")
+                                .foregroundStyle(.secondary).monospacedDigit()
+                        }
+                    }
+                    if state.watchers.isEmpty {
+                        Text("Sin vigilantes. Pídeselo a Saphire en el chat: "
+                             + "«avísame cuando reciba un correo de Juan».")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(state.watchers) { w in
+                            WatcherRow(watcher: w)
+                        }
+                    }
+                }
+            } header: {
+                HStack {
+                    sectionHeader("Vigilantes (watchdog)", "eye")
+                    HelpButton(text: "Comprobaciones ligeras que revisan el correo o "
+                               + "WhatsApp cada pocos minutos y te avisan cuando llega "
+                               + "algo que coincida. No cargan el modelo: son una "
+                               + "consulta local instantánea. La app debe seguir abierta.")
                 }
             }
 
@@ -471,6 +509,51 @@ private struct SchedulesSettings: View {
             hour: comps.hour ?? 0, minute: comps.minute ?? 0,
             weekdays: weekdays, model: model.isEmpty ? state.selectedModel : model)
         title = ""; prompt = ""; weekdays = []
+    }
+}
+
+/// One watcher in the watchdog list: what it watches, its filters, and the
+/// optional smart instruction, with enable/delete controls.
+private struct WatcherRow: View {
+    @EnvironmentObject var state: AppState
+    let watcher: Watcher
+
+    var body: some View {
+        HStack(alignment: .top) {
+            Image(systemName: watcher.source == .email ? "envelope" : "message")
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(watcher.title).fontWeight(.medium)
+                Text(criteriaLabel)
+                    .font(.caption).foregroundStyle(.secondary)
+                if !watcher.instruction.isEmpty {
+                    Text("Acción: \(watcher.instruction)")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { watcher.enabled },
+                set: { state.setWatcherEnabled(watcher.id, $0) }))
+                .labelsHidden()
+            Button {
+                state.deleteWatcher(watcher.id)
+            } label: {
+                Image(systemName: "trash").foregroundStyle(.red)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var criteriaLabel: String {
+        var parts: [String] = [watcher.source == .email ? "Correo" : "WhatsApp"]
+        if !watcher.filter.isEmpty { parts.append("de «\(watcher.filter)»") }
+        if !watcher.contains.isEmpty { parts.append("con «\(watcher.contains)»") }
+        parts.append(watcher.once ? "aviso único" : "permanente")
+        return parts.joined(separator: " · ")
     }
 }
 

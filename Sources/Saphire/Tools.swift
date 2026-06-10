@@ -94,6 +94,83 @@ let deepSearchTool = ToolSpec.function(
     required: ["goal"]
 )
 
+/// Spotlight-backed file search. Read-only and fast (uses the existing index),
+/// so it never needs the user's confirmation, unlike a `find` via run_command.
+let searchFilesTool = ToolSpec.function(
+    name: "search_files",
+    description: "Busca archivos en el Mac usando el índice de Spotlight. SOLO "
+        + "LECTURA: no abre ni modifica nada. Modo 'name' busca por nombre de "
+        + "archivo; modo 'content' busca texto dentro del contenido de los "
+        + "archivos. Devuelve las rutas encontradas. Úsala para localizar un "
+        + "archivo (luego puedes leerlo con run_command y cat).",
+    properties: [
+        "query": .init(type: "string", description: "Texto a buscar."),
+        "mode": .init(type: "string",
+                      description: "Dónde buscar: 'name' (nombre de archivo, por defecto) "
+                          + "o 'content' (dentro del contenido).",
+                      enumValues: ["name", "content"]),
+        "folder": .init(type: "string",
+                        description: "Carpeta a la que limitar la búsqueda, p.ej. "
+                            + "\"~/Documents\". Vacío = todo el Mac."),
+        "limit": .init(type: "integer",
+                       description: "Máximo de resultados (1–50; por defecto 20).")
+    ],
+    required: ["query"]
+)
+
+/// Runs `mdfind` directly (no shell, so the query can't inject commands) and
+/// returns up to `limit` matching paths.
+func searchFiles(query: String, mode: String, folder: String, limit: Int) async -> String {
+    let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !q.isEmpty else { return "Error: falta el parámetro 'query'." }
+    let lim = max(1, min(limit, 50))
+
+    var args: [String] = []
+    let dir = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !dir.isEmpty {
+        args += ["-onlyin", NSString(string: dir).expandingTildeInPath]
+    }
+    if mode.trimmingCharacters(in: .whitespaces).lowercased() == "content" {
+        args.append(q)              // plain query → content + metadata search
+    } else {
+        args += ["-name", q]        // filename search
+    }
+    let finalArgs = args
+
+    let out: String = await withCheckedContinuation { cont in
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+            p.arguments = finalArgs
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            do { try p.run() } catch {
+                cont.resume(returning: "Error: no se pudo ejecutar la búsqueda "
+                    + "(\(error.localizedDescription)).")
+                return
+            }
+            let killItem = DispatchWorkItem { if p.isRunning { p.terminate() } }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: killItem)
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            killItem.cancel()
+            cont.resume(returning: String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+    if out.hasPrefix("Error:") { return out }
+
+    let paths = out.split(separator: "\n").map(String.init)
+    guard !paths.isEmpty else {
+        return "Spotlight no encontró archivos para «\(q)»"
+            + (dir.isEmpty ? "." : " en \(dir).")
+    }
+    var lines = paths.prefix(lim).enumerated().map { "\($0.offset + 1). \($0.element)" }
+    if paths.count > lim { lines.append("…y \(paths.count - lim) resultados más.") }
+    return "Archivos encontrados para «\(q)» (\(min(paths.count, lim)) de \(paths.count)):\n"
+        + lines.joined(separator: "\n")
+}
+
 /// Current local date and time — stops the model from guessing "now".
 let datetimeTool = ToolSpec.function(
     name: "get_datetime",
@@ -650,6 +727,7 @@ private let readOnlyCommands: Set<String> = [
     "host", "ping", "traceroute", "arp", "say", "pbpaste",
     "basename", "dirname", "realpath", "readlink", "md5", "shasum", "sha256sum",
     "jq", "yq", "column",
+    "mdfind", "mdls", "system_profiler", "vm_stat", "sysctl", "w", "who", "last",
     // NOTE: `tee` writes/overwrites files and `open` launches arbitrary apps or
     // files — both have side effects, so they are deliberately NOT read-only and
     // fall through to user confirmation.

@@ -76,6 +76,15 @@ final class Database {
             created_at REAL NOT NULL
         );
         """)
+        // Watchdog watchers: standing "tell me when X arrives" checks. Stored as
+        // JSON blobs (same approach as inbox items).
+        exec("""
+        CREATE TABLE IF NOT EXISTS watchers(
+            id TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        """)
         // Log of headless scheduled-task executions. Kept out of `conversations`
         // so autonomous runs never appear in the chat sidebar.
         exec("""
@@ -329,6 +338,47 @@ final class Database {
                   let item = try? decoder.decode(InboxItem.self,
                                                  from: Data(String(cString: payloadC).utf8)) else { continue }
             out.append(item)
+        }
+        return out
+    }
+
+    // MARK: - Watchers (watchdog)
+
+    func saveWatcher(_ w: Watcher) {
+        guard let data = try? encoder.encode(w),
+              let json = String(data: data, encoding: .utf8) else { return }
+        let sql = """
+        INSERT INTO watchers(id,payload,created_at) VALUES(?,?,?)
+        ON CONFLICT(id) DO UPDATE SET payload=excluded.payload;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, w.id.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, json, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 3, w.createdAt.timeIntervalSince1970)
+        sqlite3_step(stmt)
+    }
+
+    func deleteWatcher(id: UUID) {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM watchers WHERE id=?;", -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, id.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_step(stmt)
+    }
+
+    func loadWatchers() -> [Watcher] {
+        let sql = "SELECT payload FROM watchers ORDER BY created_at ASC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [Watcher] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let payloadC = sqlite3_column_text(stmt, 0),
+                  let w = try? decoder.decode(Watcher.self,
+                                              from: Data(String(cString: payloadC).utf8)) else { continue }
+            out.append(w)
         }
         return out
     }

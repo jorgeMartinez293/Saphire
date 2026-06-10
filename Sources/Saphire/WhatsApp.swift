@@ -328,6 +328,77 @@ private func searchMessages(_ db: OpaquePointer?, query: String, since: Double?,
     return "Mensajes de WhatsApp que contienen «\(query)»:\n\n" + rows.joined(separator: "\n")
 }
 
+// MARK: - Watchdog support (cheap "anything new?" probes)
+
+/// Newest modification time among ChatStorage.sqlite and its WAL — the
+/// watchdog's zero-cost gate to skip the copy + query when nothing changed.
+func waStoreNewestMTime() -> Date? {
+    let store = whatsAppStorePath()
+    let fm = FileManager.default
+    var newest: Date? = nil
+    for suffix in ["", "-wal"] {
+        if let attrs = try? fm.attributesOfItem(atPath: store + suffix),
+           let m = attrs[.modificationDate] as? Date {
+            if newest == nil || m > newest! { newest = m }
+        }
+    }
+    return newest
+}
+
+/// Incoming WhatsApp text messages strictly newer than `epoch` (Unix seconds),
+/// newest first. Per-watcher filtering happens in Swift so one store copy
+/// serves every WhatsApp watcher in a scan. Returns [] on any failure.
+func waMessagesSince(epoch: Double, limit: Int = 50) async -> [WatchHit] {
+    let sinceTS = epoch - coreDataEpoch
+    return await withCheckedContinuation { (cont: CheckedContinuation<[WatchHit], Never>) in
+        DispatchQueue.global(qos: .utility).async {
+            let store = whatsAppStorePath()
+            guard FileManager.default.fileExists(atPath: store),
+                  let work = try? copyStoreToTemp(store) else {
+                cont.resume(returning: []); return
+            }
+            defer { try? FileManager.default.removeItem(at: work.deletingLastPathComponent()) }
+
+            var db: OpaquePointer?
+            let uri = "file:\(work.path)?mode=ro"
+            guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+                sqlite3_close(db); cont.resume(returning: []); return
+            }
+            defer { sqlite3_close(db) }
+
+            let sql = """
+            SELECT m.ZMESSAGEDATE, c.ZPARTNERNAME, c.ZSESSIONTYPE, p.ZPUSHNAME, m.ZTEXT
+            FROM ZWAMESSAGE m
+            JOIN ZWACHATSESSION c ON m.ZCHATSESSION = c.Z_PK
+            LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+            LEFT JOIN ZWAPROFILEPUSHNAME p ON p.ZJID = gm.ZMEMBERJID
+            WHERE m.ZISFROMME = 0 AND m.ZTEXT IS NOT NULL AND m.ZMESSAGEDATE > ?
+            ORDER BY m.ZMESSAGEDATE DESC LIMIT ?;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                cont.resume(returning: []); return
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_double(stmt, 1, sinceTS)
+            sqlite3_bind_int(stmt, 2, Int32(max(1, limit)))
+
+            var hits: [WatchHit] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let chat = colText(stmt, 1) ?? "(chat)"
+                let isGroup = sqlite3_column_int(stmt, 2) == 1
+                let sender = colText(stmt, 3)
+                let origin = isGroup ? "\(chat) · \(sender ?? "alguien")" : chat
+                hits.append(WatchHit(
+                    epoch: sqlite3_column_double(stmt, 0) + coreDataEpoch,
+                    origin: origin,
+                    text: colText(stmt, 4) ?? ""))
+            }
+            cont.resume(returning: hits)
+        }
+    }
+}
+
 // MARK: - sqlite helpers
 
 /// Reads a text column as a Swift String (nil when the column is NULL).

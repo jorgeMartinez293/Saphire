@@ -208,6 +208,80 @@ private func queryInbox(_ db: OpaquePointer?, query: String, unreadOnly: Bool,
     return blocks.joined(separator: "\n")
 }
 
+// MARK: - Watchdog support (cheap "anything new?" probes)
+
+/// Newest modification time among the Envelope Index and its WAL. The watchdog
+/// uses this as a zero-cost gate: if nothing changed since the last scan, the
+/// copy + query is skipped entirely.
+func mailStoreNewestMTime() -> Date? {
+    guard let store = envelopeIndexPath() else { return nil }
+    let fm = FileManager.default
+    var newest: Date? = nil
+    for suffix in ["", "-wal"] {
+        if let attrs = try? fm.attributesOfItem(atPath: store + suffix),
+           let m = attrs[.modificationDate] as? Date {
+            if newest == nil || m > newest! { newest = m }
+        }
+    }
+    return newest
+}
+
+/// Inbox messages strictly newer than `epoch` (Unix seconds), newest first.
+/// Deterministic and model-free; filtering per watcher happens in Swift so one
+/// store copy serves every email watcher in a scan. Returns [] on any failure
+/// (a watchdog probe must never surface errors to the user).
+func mailMessagesSince(epoch: Double, limit: Int = 50) async -> [WatchHit] {
+    await withCheckedContinuation { (cont: CheckedContinuation<[WatchHit], Never>) in
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            guard let store = envelopeIndexPath(), fm.fileExists(atPath: store),
+                  let work = try? copyMailStoreToTemp(store) else {
+                cont.resume(returning: []); return
+            }
+            defer { try? fm.removeItem(at: work.deletingLastPathComponent()) }
+
+            var db: OpaquePointer?
+            let uri = "file:\(work.path)?mode=ro"
+            guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+                sqlite3_close(db); cont.resume(returning: []); return
+            }
+            defer { sqlite3_close(db) }
+
+            let sql = """
+            SELECT m.date_received, a.comment, a.address, s.subject
+            FROM messages m
+            LEFT JOIN addresses a ON m.sender = a.ROWID
+            LEFT JOIN subjects s ON m.subject = s.ROWID
+            WHERE m.mailbox IN (
+                SELECT ROWID FROM mailboxes
+                WHERE url LIKE '%/INBOX' OR url LIKE '%Bandeja%20de%20entrada'
+            )
+            AND m.deleted = 0 AND m.date_received > ?
+            ORDER BY m.date_received DESC LIMIT ?;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                cont.resume(returning: []); return
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_double(stmt, 1, epoch)
+            sqlite3_bind_int(stmt, 2, Int32(max(1, limit)))
+
+            var hits: [WatchHit] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let name = mailColText(stmt, 1) ?? ""
+                let addr = mailColText(stmt, 2) ?? ""
+                let from = name.isEmpty ? addr : (addr.isEmpty ? name : "\(name) <\(addr)>")
+                hits.append(WatchHit(
+                    epoch: sqlite3_column_double(stmt, 0),
+                    origin: from,
+                    text: mailColText(stmt, 3) ?? "(sin asunto)"))
+            }
+            cont.resume(returning: hits)
+        }
+    }
+}
+
 // MARK: - .emlx body extraction
 
 /// Walks the newest Mail version dir once, collecting the text body of every

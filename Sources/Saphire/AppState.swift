@@ -179,6 +179,26 @@ final class AppState: ObservableObject {
     @Published var calendarEnabled: Bool = AppState.b("calendarEnabled", true) {
         didSet { UserDefaults.standard.set(calendarEnabled, forKey: "calendarEnabled") }
     }
+    @Published var searchFilesEnabled: Bool = AppState.b("searchFilesEnabled", true) {
+        didSet { UserDefaults.standard.set(searchFilesEnabled, forKey: "searchFilesEnabled") }
+    }
+
+    // MARK: - Watchdog (event watchers; persisted in UserDefaults + DB)
+    /// Standing "tell me when X arrives" checks. See Watchdog.swift.
+    @Published var watchers: [Watcher] = []
+    /// Master switch for the periodic watcher scan (and the manage_watchers tool).
+    @Published var watchdogEnabled: Bool = AppState.b("watchdogEnabled", true) {
+        didSet { UserDefaults.standard.set(watchdogEnabled, forKey: "watchdogEnabled") }
+    }
+    /// Minutes between watcher scans. Each scan is a local SQLite read (no
+    /// model), and is skipped outright when the source store hasn't changed.
+    @Published var watchdogMinutes: Int = AppState.i("watchdogMinutes", 5) {
+        didSet { UserDefaults.standard.set(watchdogMinutes, forKey: "watchdogMinutes") }
+    }
+    /// When the last watcher scan ran (per launch; not persisted).
+    private var lastWatchdogScan: Date? = nil
+    /// True while a scan is in flight, so a slow disk can't stack scans.
+    private var watchdogScanning = false
 
     /// Documents staged for the next message (extracted text embedded as context).
     @Published var pendingDocuments: [DocumentRef] = []
@@ -442,6 +462,7 @@ final class AppState: ObservableObject {
     init() {
         memory = db.loadMemory()
         scheduledTasks = db.loadScheduledTasks()
+        watchers = db.loadWatchers()
         inboxItems = db.loadInboxItems()
         db.purgeConversations(olderThan: retentionDays)
         db.purgeTaskRuns(olderThan: taskRunRetentionDays)
@@ -612,6 +633,9 @@ final class AppState: ObservableObject {
         // Piggyback on the 60s tick to nudge the user about queued inbox items
         // when they come back to the Mac (cheap; no model involved).
         nudgeInboxIfPresent()
+        // …and to run the watchdog scan when its interval has elapsed. The scan
+        // itself is deterministic SQLite (no model), so it may run any time.
+        checkWatchersIfDue()
         // One scheduled run at a time, and never on top of a live user stream.
         guard !headlessActive, !isStreaming else { return }
         let now = Date()
@@ -636,29 +660,38 @@ final class AppState: ObservableObject {
         return true
     }
 
-    /// Runs a task's prompt through the full agent loop with no UI, saves the
-    /// result as a conversation, and posts a notification. Stamps `lastRun` up
-    /// front so a slow run can't be re-triggered by the next minute's tick.
+    /// Runs a task's prompt through the full agent loop with no UI. Stamps
+    /// `lastRun` up front so a slow run can't be re-triggered by the next
+    /// minute's tick.
     private func runScheduledTask(_ task: ScheduledTask) async {
         guard !headlessActive else { return }
-        headlessActive = true
-        headlessTaskTitle = task.title
-        defer { headlessActive = false; headlessTaskTitle = nil }
-
         // Stamp lastRun now (persisted) so the 60s timer won't fire it again.
         if let i = scheduledTasks.firstIndex(where: { $0.id == task.id }) {
             scheduledTasks[i].lastRun = Date()
             db.saveScheduledTask(scheduledTasks[i])
         }
+        await runHeadlessJob(sourceID: task.id, title: task.title,
+                             prompt: task.prompt, model: task.model)
+    }
 
-        if !isRemote(task.model) && !isCompat(task.model) { await client.ensureServerRunning() }
+    /// Core headless agent run shared by scheduled tasks and smart watchers:
+    /// feeds `prompt` through the full agent loop with no UI, records the run in
+    /// the task-run log, and posts a notification with the result.
+    private func runHeadlessJob(sourceID: UUID, title: String,
+                                prompt: String, model: String) async {
+        guard !headlessActive else { return }
+        headlessActive = true
+        headlessTaskTitle = title
+        defer { headlessActive = false; headlessTaskTitle = nil }
+
+        if !isRemote(model) && !isCompat(model) { await client.ensureServerRunning() }
 
         // Remember how many inbox items were already queued so we can tell whether
         // this run raised new ones and surface them right away (see below).
         let inboxBefore = inboxItems.count
 
         var history: [OllamaMessage] = [systemMessage()]
-        history.append(OllamaMessage(role: "user", content: task.prompt))
+        history.append(OllamaMessage(role: "user", content: prompt))
         let tools = buildTools()
         let acc = TokenAccumulator()
         let onToken: @Sendable (String, String) -> Void = { c, _ in
@@ -677,7 +710,7 @@ final class AppState: ObservableObject {
             while true {
                 rounds += 1
                 let calls = try await chat(
-                    model: task.model, messages: history, tools: tools,
+                    model: model, messages: history, tools: tools,
                     options: genOptions, think: false, onToken: onToken)
                 let prose = acc.take()
                 if calls.isEmpty {
@@ -725,7 +758,7 @@ final class AppState: ObservableObject {
                     "Ya tienes los resultados de las herramientas en los mensajes anteriores. "
                     + "Redacta AHORA el resultado final de la tarea con esa información. "
                     + "No llames a más herramientas."))
-                _ = try await chat(model: task.model, messages: history, tools: nil,
+                _ = try await chat(model: model, messages: history, tools: nil,
                                    options: genOptions, think: false, onToken: onToken)
                 finalText = acc.take()
             }
@@ -736,14 +769,14 @@ final class AppState: ObservableObject {
 
         // Record the run in its own log (NOT the chat sidebar) so the user can
         // review what happened without autonomous runs polluting conversations.
-        let run = TaskRun(taskID: task.id, title: task.title, model: task.model,
-                          prompt: task.prompt,
+        let run = TaskRun(taskID: sourceID, title: title, model: model,
+                          prompt: prompt,
                           output: finalText.isEmpty ? "(sin respuesta)" : finalText,
                           ok: ok)
         taskRuns.insert(run, at: 0)
         db.saveTaskRun(run)
 
-        postTaskNotification(task: task, summary: finalText)
+        postTaskNotification(title: title, summary: finalText)
 
         // If the run queued new inbox items, surface them now. The minute-tick
         // nudge only fires on an idle→active edge, so an item raised while the user
@@ -791,17 +824,218 @@ final class AppState: ObservableObject {
         return phrases.contains { t.contains($0) }
     }
 
+    // MARK: - Watchdog (event watchers)
+
+    func addWatcher(_ w: Watcher) {
+        watchers.append(w)
+        db.saveWatcher(w)
+        requestNotificationPermission()
+    }
+
+    func setWatcherEnabled(_ id: UUID, _ enabled: Bool) {
+        guard let i = watchers.firstIndex(where: { $0.id == id }) else { return }
+        watchers[i].enabled = enabled
+        // Re-arm from "now" so re-enabling doesn't replay everything that
+        // arrived while the watcher was off.
+        if enabled { watchers[i].lastSeen = Date().timeIntervalSince1970 }
+        db.saveWatcher(watchers[i])
+    }
+
+    func deleteWatcher(_ id: UUID) {
+        db.deleteWatcher(id: id)
+        watchers.removeAll { $0.id == id }
+    }
+
+    /// Fires a scan from the minute tick when the interval has elapsed. The
+    /// scan never loads the model; it's bounded by a couple of SQLite reads.
+    private func checkWatchersIfDue() {
+        guard watchdogEnabled, watchers.contains(where: { $0.enabled }),
+              !watchdogScanning else { return }
+        let interval = Double(max(1, watchdogMinutes)) * 60
+        if let last = lastWatchdogScan, Date().timeIntervalSince(last) < interval { return }
+        lastWatchdogScan = Date()
+        watchdogScanning = true
+        Task {
+            await self.runWatchdogScan()
+            self.watchdogScanning = false
+        }
+    }
+
+    /// One scan: per source, skip outright if the store file hasn't changed
+    /// since the oldest `lastSeen`; otherwise read everything new once and
+    /// match it against each watcher in Swift.
+    private func runWatchdogScan() async {
+        let mailWatchers = watchers.filter { $0.enabled && $0.source == .email }
+        if !mailWatchers.isEmpty, let oldest = mailWatchers.map(\.lastSeen).min(),
+           let mtime = mailStoreNewestMTime(), mtime.timeIntervalSince1970 > oldest {
+            let hits = await mailMessagesSince(epoch: oldest)
+            for w in mailWatchers { await handleWatchHits(w, hits) }
+        }
+        let waWatchers = watchers.filter { $0.enabled && $0.source == .whatsapp }
+        if !waWatchers.isEmpty, let oldest = waWatchers.map(\.lastSeen).min(),
+           let mtime = waStoreNewestMTime(), mtime.timeIntervalSince1970 > oldest {
+            let hits = await waMessagesSince(epoch: oldest)
+            for w in waWatchers { await handleWatchHits(w, hits) }
+        }
+    }
+
+    /// Applies one watcher to the scan's hits. On a match: advances `lastSeen`
+    /// (so nothing fires twice), then either runs the watcher's smart
+    /// instruction headlessly, or — the deterministic default — posts an
+    /// immediate notification and queues an inbox notice. No model is touched
+    /// unless the watcher explicitly carries an instruction.
+    private func handleWatchHits(_ w: Watcher, _ hits: [WatchHit]) async {
+        let mine = hits.filter {
+            $0.epoch > w.lastSeen
+                && watchContains($0.origin, w.filter)
+                && watchContains($0.text, w.contains)
+        }
+        guard !mine.isEmpty, let newest = mine.map(\.epoch).max() else { return }
+        guard let i = watchers.firstIndex(where: { $0.id == w.id }) else { return }
+        watchers[i].lastSeen = max(watchers[i].lastSeen, newest)
+        db.saveWatcher(watchers[i])
+
+        let lines = mine.prefix(5).map {
+            "[\(watchHitDateLabel($0.epoch))] \($0.origin): \(clipWatchText($0.text, 140))"
+        }
+
+        // One-shot watcher: it just fired, so remove it before doing the work.
+        if w.once { deleteWatcher(w.id) }
+
+        let instruction = w.instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !instruction.isEmpty, !headlessActive, !isStreaming {
+            // Smart watcher: wake the model once, with the new messages inline.
+            let prompt = instruction + "\n\nContexto: el vigilante «\(w.title)» ha "
+                + "detectado \(mine.count) novedad(es):\n" + lines.joined(separator: "\n")
+            await runHeadlessJob(sourceID: w.id, title: "Vigilante: \(w.title)",
+                                 prompt: prompt, model: selectedModel)
+            return
+        }
+
+        // Deterministic path (also the fallback when the model is busy):
+        // notification now + a notice waiting in the inbox. Zero model time.
+        let icon = w.source == .email ? "📬" : "💬"
+        let first = mine[0]
+        let title = mine.count == 1
+            ? "\(icon) \(first.origin): \(clipWatchText(first.text, 100))"
+            : "\(icon) \(mine.count) novedades de «\(w.title)»"
+        let item = InboxItem(kind: .notice, title: title,
+                             detail: lines.joined(separator: "\n"),
+                             options: [],
+                             sourceTaskTitle: "Vigilante: \(w.title)")
+        inboxItems.append(item)
+        db.saveInboxItem(item)
+        postWatcherNotification(w, body: lines.joined(separator: "\n"))
+    }
+
+    private func clipWatchText(_ s: String, _ max: Int) -> String {
+        let t = s.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.count > max ? String(t.prefix(max)) + "…" : t
+    }
+
+    /// Immediate alert for a fired watcher; tapping it opens the inbox.
+    private func postWatcherNotification(_ w: Watcher, body: String) {
+        requestNotificationPermission()
+        let center = UNUserNotificationCenter.current()
+        center.setNotificationCategories([
+            UNNotificationCategory(identifier: AppState.questionCategoryID, actions: [],
+                                   intentIdentifiers: [], options: [])
+        ])
+        let content = UNMutableNotificationContent()
+        content.title = "Saphire · \(w.title)"
+        content.body = String(body.prefix(240))
+        content.sound = .default
+        content.categoryIdentifier = AppState.questionCategoryID
+        center.add(UNNotificationRequest(identifier: UUID().uuidString,
+                                         content: content, trigger: nil))
+    }
+
+    /// Backs the `manage_watchers` tool: create/list/delete watchers from chat.
+    private func handleWatchersTool(_ call: ToolCallRequest) -> String {
+        let raw = (argString("action", call) ?? "")
+            .trimmingCharacters(in: .whitespaces).lowercased()
+            .folding(options: .diacriticInsensitive, locale: nil)
+        // The tool is described in Spanish, so the local model often sends the
+        // action/source in Spanish too. Normalize before matching instead of
+        // silently failing (which let the model narrate a fake "creado").
+        let action: String
+        switch raw {
+        case "create", "crear", "crea", "add", "nuevo", "añadir", "anadir": action = "create"
+        case "list", "listar", "lista", "ver", "mostrar": action = "list"
+        case "delete", "borrar", "borra", "eliminar", "elimina", "quitar", "remove": action = "delete"
+        default: action = raw
+        }
+        switch action {
+        case "list":
+            if watchers.isEmpty { return "No hay vigilantes creados." }
+            return watchers.map { w in
+                var parts: [String] = [w.source == .email ? "correo" : "whatsapp"]
+                if !w.filter.isEmpty { parts.append("de «\(w.filter)»") }
+                if !w.contains.isEmpty { parts.append("que contenga «\(w.contains)»") }
+                if !w.instruction.isEmpty { parts.append("acción: \(w.instruction)") }
+                parts.append(w.once ? "aviso único" : "permanente")
+                let state = w.enabled ? "" : " (desactivado)"
+                return "• «\(w.title)»\(state) — " + parts.joined(separator: ", ")
+            }.joined(separator: "\n")
+
+        case "create":
+            let title = (argString("title", call) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return "Error: falta 'title' para crear el vigilante." }
+            let srcRaw = (argString("source", call) ?? "")
+                .trimmingCharacters(in: .whitespaces).lowercased()
+                .folding(options: .diacriticInsensitive, locale: nil)
+            let source: WatchSource
+            switch srcRaw {
+            case "email", "correo", "mail", "e-mail", "gmail": source = .email
+            case "whatsapp", "wa", "wasap", "wsp", "mensaje", "mensajes": source = .whatsapp
+            default:
+                return "Error: 'source' debe ser \"email\" o \"whatsapp\"."
+            }
+            let filter = (argString("filter", call) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let contains = (argString("contains", call) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !filter.isEmpty || !contains.isEmpty else {
+                return "Error: indica al menos 'filter' (remitente o chat) o 'contains' "
+                    + "(texto), o el vigilante saltaría con cada mensaje."
+            }
+            let instruction = (argString("instruction", call) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let once = argBool("once", call, default: false)
+            addWatcher(Watcher(title: title, source: source, filter: filter,
+                               contains: contains, instruction: instruction, once: once))
+            let what = source == .email ? "correo" : "WhatsApp"
+            return "Vigilante creado: «\(title)» (\(what)"
+                + (filter.isEmpty ? "" : ", de «\(filter)»")
+                + (contains.isEmpty ? "" : ", que contenga «\(contains)»")
+                + (once ? ", aviso único" : ", permanente") + "). "
+                + "Se comprueba cada \(watchdogMinutes) min sin usar el modelo, "
+                + "mientras Saphire esté abierta; solo detecta mensajes a partir de ahora."
+
+        case "delete":
+            let title = (argString("title", call) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return "Error: falta 'title' para borrar el vigilante." }
+            let matches = watchers.filter { $0.title.caseInsensitiveCompare(title) == .orderedSame }
+            guard !matches.isEmpty else { return "No se encontró ningún vigilante titulado «\(title)»." }
+            matches.forEach { deleteWatcher($0.id) }
+            return matches.count == 1 ? "Vigilante borrado: «\(title)»."
+                                      : "\(matches.count) vigilantes «\(title)» borrados."
+
+        default:
+            return "Error: acción desconocida «\(action)». Usa create, list o delete."
+        }
+    }
+
     // MARK: - Notifications
 
     private func requestNotificationPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// Posts a local notification summarizing a finished scheduled run.
-    private func postTaskNotification(task: ScheduledTask, summary: String) {
+    /// Posts a local notification summarizing a finished headless run.
+    private func postTaskNotification(title: String, summary: String) {
         let center = UNUserNotificationCenter.current()
         let content = UNMutableNotificationContent()
-        content.title = "Saphire · \(task.title)"
+        content.title = "Saphire · \(title)"
         let body = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         content.body = body.isEmpty ? "Tarea ejecutada." : String(body.prefix(240))
         content.sound = .default
@@ -1185,6 +1419,12 @@ final class AppState: ObservableObject {
                 + "manage_scheduled_tasks para crear, listar o borrar tareas recurrentes que la "
                 + "propia Saphire ejecutará sola a una hora fija (úsala cuando el usuario pida "
                 + "que recuerdes o automatices algo de forma periódica); "
+                + "manage_watchers para crear vigilantes: avisos automáticos cuando llegue un "
+                + "correo o mensaje de WhatsApp concreto (úsala cuando el usuario pida ser "
+                + "avisado al recibir algo, p.ej. «avísame cuando me escriba Juan»; la "
+                + "comprobación es ligera y no usa el modelo); "
+                + "search_files para localizar archivos en el Mac por nombre o contenido "
+                + "(Spotlight, solo lectura); "
                 + "remember_fact para proponer guardar un dato estable del usuario (requiere su "
                 + "confirmación); "
                 + "ask_user para dejar al usuario una pregunta pendiente con 2-4 opciones de "
@@ -1597,6 +1837,8 @@ final class AppState: ObservableObject {
         if remindersEnabled { t.append(manageRemindersTool) }
         if calendarEnabled { t.append(manageCalendarTool) }
         if scheduleTaskToolEnabled { t.append(manageScheduledTasksTool) }
+        if searchFilesEnabled { t.append(searchFilesTool) }
+        if watchdogEnabled { t.append(manageWatchersTool) }
         if rememberFactEnabled { t.append(rememberFactTool) }
         // ask_user / notify_user: in an autonomous run they let the model defer a
         // decision or leave a note instead of dropping it. In a chat they queue the
@@ -1751,6 +1993,15 @@ final class AppState: ObservableObject {
         case "manage_scheduled_tasks":
             return handleScheduledTaskTool(call)
 
+        case "manage_watchers":
+            return handleWatchersTool(call)
+
+        case "search_files":
+            return await searchFiles(query: argString("query", call) ?? "",
+                                     mode: argString("mode", call) ?? "name",
+                                     folder: argString("folder", call) ?? "",
+                                     limit: argInt("limit", call, default: 20))
+
         case "ask_user":
             return handleAskUserTool(call)
 
@@ -1786,15 +2037,21 @@ final class AppState: ObservableObject {
             return "Error: deep_search necesita la búsqueda web configurada."
         }
         let steps = max(2, min(maxSteps, 12))
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "es_ES")
+        df.dateFormat = "EEEE d 'de' MMMM 'de' yyyy"
         let researchSystem = OllamaMessage(role: "system", content: """
-            Eres un agente de investigación autónomo. Objetivo: investigar a fondo el \
+            Eres un agente de investigación autónomo. Fecha actual: \(df.string(from: Date())). \
+            Objetivo: investigar a fondo el \
             tema dado y entregar un informe completo, preciso y bien estructurado en \
             español.
             Método: descompón el objetivo en sub-preguntas; usa web_search con consultas \
-            variadas y específicas; usa fetch_url para leer en detalle las fuentes más \
+            variadas y específicas (no repitas una consulta ya hecha: refínala o cambia \
+            de ángulo); usa fetch_url para leer en detalle las fuentes más \
             prometedoras (no te quedes solo con los fragmentos). Cruza varias fuentes, \
             compara y verifica los datos concretos (precios, fechas, cifras, \
-            disponibilidad). Sigue buscando hasta tener información suficiente y actual.
+            disponibilidad), dando prioridad a la información más reciente. Sigue \
+            buscando hasta tener información suficiente y actual.
             Cuando ya tengas bastante, responde SIN llamar a más herramientas con un \
             informe que incluya: (1) un resumen ejecutivo, (2) los hallazgos clave con \
             cifras concretas, (3) una comparación (usa una tabla Markdown si procede) y \
@@ -1812,12 +2069,30 @@ final class AppState: ObservableObject {
             if !c.isEmpty { acc.append(c) }
         }
 
+        // Clips all but the most recent tool results so a long investigation
+        // doesn't outgrow num_ctx (which would silently evict the system prompt
+        // and the earliest evidence). The model has already read the old pages;
+        // keeping a stub preserves which sources were used without the bulk.
+        func compactToolHistory(keepFull: Int = 4, clipTo: Int = 700) {
+            let toolIdx = history.indices.filter { history[$0].role == "tool" }
+            guard toolIdx.count > keepFull else { return }
+            for i in toolIdx.dropLast(keepFull) where history[i].content.count > clipTo {
+                history[i].content = String(history[i].content.prefix(clipTo))
+                    + "\n…(contenido antiguo recortado; ya fue leído)"
+            }
+        }
+
         var report = ""
         var finishedNaturally = false
         do {
             var round = 0
+            // Identical calls return their cached result instead of re-running:
+            // a model stuck re-issuing the same search would otherwise burn
+            // every remaining step on duplicates.
+            var executed: [String: String] = [:]
             while round < steps {
                 round += 1
+                compactToolHistory()
                 toolActivity = "🔬 Investigando (paso \(round)/\(steps))…"
                 let calls = try await chat(
                     model: selectedModel, messages: history, tools: tools,
@@ -1832,7 +2107,16 @@ final class AppState: ObservableObject {
                     case "fetch_url":  toolActivity = "🔬 Leyendo: \(argString("url", call) ?? "")"
                     default:           break
                     }
-                    let result = await executeTool(call)
+                    let key = call.name + "|" + call.argumentsJSON
+                    let result: String
+                    if let cached = executed[key] {
+                        result = "(Llamada repetida: ya hiciste exactamente esta llamada y este "
+                            + "es el mismo resultado. NO la repitas; usa otra consulta o redacta "
+                            + "el informe.)\n" + String(cached.prefix(800))
+                    } else {
+                        result = await executeTool(call)
+                        executed[key] = result
+                    }
                     history.append(OllamaMessage(role: "tool", content: result, toolName: call.name))
                 }
             }
@@ -1921,6 +2205,8 @@ final class AppState: ObservableObject {
         case "manage_reminders": return "Recordatorios: \(argString("action", call) ?? "")"
         case "manage_calendar": return "Calendario: \(argString("action", call) ?? "")"
         case "manage_scheduled_tasks": return "Tareas programadas: \(argString("action", call) ?? "")"
+        case "manage_watchers": return "Vigilantes: \(argString("action", call) ?? "")"
+        case "search_files": return "Buscando archivos: \(argString("query", call) ?? "")"
         case "ask_user": return "Preparando una pregunta…"
         case "notify_user": return "Preparando un aviso…"
         case "remember_fact": return "Memoria…"
@@ -1956,6 +2242,8 @@ final class AppState: ObservableObject {
         case "manage_reminders": (slug, detail) = ("reminders", argString("action", call))
         case "manage_calendar":  (slug, detail) = ("calendar", argString("action", call))
         case "manage_scheduled_tasks": (slug, detail) = ("scheduled_tasks", argString("action", call))
+        case "manage_watchers": (slug, detail) = ("watchers", argString("action", call))
+        case "search_files":  (slug, detail) = ("search_files", argString("query", call))
         case "remember_fact": (slug, detail) = ("memory", argString("fact", call))
         case "ask_user":     (slug, detail) = ("ask_user", nil)
         case "notify_user":  (slug, detail) = ("notify_user", nil)
