@@ -179,6 +179,9 @@ final class AppState: ObservableObject {
     @Published var calendarEnabled: Bool = AppState.b("calendarEnabled", true) {
         didSet { UserDefaults.standard.set(calendarEnabled, forKey: "calendarEnabled") }
     }
+    @Published var alarmsEnabled: Bool = AppState.b("alarmsEnabled", true) {
+        didSet { UserDefaults.standard.set(alarmsEnabled, forKey: "alarmsEnabled") }
+    }
     @Published var searchFilesEnabled: Bool = AppState.b("searchFilesEnabled", true) {
         didSet { UserDefaults.standard.set(searchFilesEnabled, forKey: "searchFilesEnabled") }
     }
@@ -677,9 +680,10 @@ final class AppState: ObservableObject {
     /// Core headless agent run shared by scheduled tasks and smart watchers:
     /// feeds `prompt` through the full agent loop with no UI, records the run in
     /// the task-run log, and posts a notification with the result.
+    @discardableResult
     private func runHeadlessJob(sourceID: UUID, title: String,
-                                prompt: String, model: String) async {
-        guard !headlessActive else { return }
+                                prompt: String, model: String) async -> Bool {
+        guard !headlessActive else { return false }
         headlessActive = true
         headlessTaskTitle = title
         defer { headlessActive = false; headlessTaskTitle = nil }
@@ -791,6 +795,7 @@ final class AppState: ObservableObject {
                 postInboxNotification(count: inboxItems.count)
             }
         }
+        return true
     }
 
     /// Heuristic: does this tool-call-less prose look like the model stalling to
@@ -899,17 +904,20 @@ final class AppState: ObservableObject {
             "[\(watchHitDateLabel($0.epoch))] \($0.origin): \(clipWatchText($0.text, 140))"
         }
 
-        // One-shot watcher: it just fired, so remove it before doing the work.
-        if w.once { deleteWatcher(w.id) }
-
         let instruction = w.instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         if !instruction.isEmpty, !headlessActive, !isStreaming {
             // Smart watcher: wake the model once, with the new messages inline.
             let prompt = instruction + "\n\nContexto: el vigilante «\(w.title)» ha "
                 + "detectado \(mine.count) novedad(es):\n" + lines.joined(separator: "\n")
-            await runHeadlessJob(sourceID: w.id, title: "Vigilante: \(w.title)",
-                                 prompt: prompt, model: selectedModel)
-            return
+            let ran = await runHeadlessJob(sourceID: w.id, title: "Vigilante: \(w.title)",
+                                           prompt: prompt, model: selectedModel)
+            // Delete a one-shot ONLY after the run actually executed (it posts its
+            // own notification on finish). If the model turned out to be busy, fall
+            // through to the deterministic notice instead of silently dropping it.
+            if ran {
+                if w.once { deleteWatcher(w.id) }
+                return
+            }
         }
 
         // Deterministic path (also the fallback when the model is busy):
@@ -926,6 +934,9 @@ final class AppState: ObservableObject {
         inboxItems.append(item)
         db.saveInboxItem(item)
         postWatcherNotification(w, body: lines.joined(separator: "\n"))
+
+        // One-shot watcher: it has now fired AND notified, so remove it last.
+        if w.once { deleteWatcher(w.id) }
     }
 
     private func clipWatchText(_ s: String, _ max: Int) -> String {
@@ -936,19 +947,8 @@ final class AppState: ObservableObject {
 
     /// Immediate alert for a fired watcher; tapping it opens the inbox.
     private func postWatcherNotification(_ w: Watcher, body: String) {
-        requestNotificationPermission()
-        let center = UNUserNotificationCenter.current()
-        center.setNotificationCategories([
-            UNNotificationCategory(identifier: AppState.questionCategoryID, actions: [],
-                                   intentIdentifiers: [], options: [])
-        ])
-        let content = UNMutableNotificationContent()
-        content.title = "Saphire · \(w.title)"
-        content.body = String(body.prefix(240))
-        content.sound = .default
-        content.categoryIdentifier = AppState.questionCategoryID
-        center.add(UNNotificationRequest(identifier: UUID().uuidString,
-                                         content: content, trigger: nil))
+        deliverUserAlert(title: "Saphire · \(w.title)", body: String(body.prefix(240)),
+                         opensInbox: true)
     }
 
     /// Backs the `manage_watchers` tool: create/list/delete watchers from chat.
@@ -1033,14 +1033,170 @@ final class AppState: ObservableObject {
 
     /// Posts a local notification summarizing a finished headless run.
     private func postTaskNotification(title: String, summary: String) {
-        let center = UNUserNotificationCenter.current()
-        let content = UNMutableNotificationContent()
-        content.title = "Saphire · \(title)"
         let body = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        content.body = body.isEmpty ? "Tarea ejecutada." : String(body.prefix(240))
-        content.sound = .default
-        center.add(UNNotificationRequest(identifier: UUID().uuidString,
-                                         content: content, trigger: nil))
+        deliverUserAlert(title: "Saphire · \(title)",
+                         body: body.isEmpty ? "Tarea ejecutada." : String(body.prefix(240)))
+    }
+
+    /// Single delivery path for every user alert. Real system notifications
+    /// are only presented by macOS when the app's signature passes AMFI
+    /// validation (notarized / Developer ID); for a locally signed build,
+    /// usernoted accepts the request but never shows a banner (authorization
+    /// reads Denied, no prompt is ever offered, and `add` reports no error).
+    /// So: use the system banner when we're genuinely authorized, and fall
+    /// back to an in-app toast (Toast.swift) otherwise.
+    private func deliverUserAlert(title: String, body: String, opensInbox: Bool = false) {
+        let showToast: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor in
+                ToastCenter.shared.show(title: title, body: body) { [weak self] in
+                    if opensInbox { self?.showInbox() } else { self?.onShowOverlay?() }
+                }
+            }
+        }
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            guard settings.authorizationStatus == .authorized else {
+                showToast()
+                return
+            }
+            center.setNotificationCategories([
+                UNNotificationCategory(identifier: AppState.questionCategoryID, actions: [],
+                                       intentIdentifiers: [], options: [])
+            ])
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            if opensInbox { content.categoryIdentifier = AppState.questionCategoryID }
+            center.add(UNNotificationRequest(identifier: UUID().uuidString,
+                                             content: content, trigger: nil)) { err in
+                if err != nil { showToast() }
+            }
+        }
+    }
+
+    // MARK: - Alarms (one-shot local notifications fired by the system)
+
+    /// Identifier prefix for alarm notification requests, so `list`/`delete` can
+    /// tell Saphire's alarms apart from its other (question/notice) notifications.
+    nonisolated static let alarmIDPrefix = "alarm_"
+
+    /// Backs the `manage_alarms` tool. An alarm is a non-repeating
+    /// `UNCalendarNotificationTrigger`: the system delivers the banner + sound at
+    /// the chosen time on its own, so it works even if Saphire is idle. The set of
+    /// pending requests *is* the store — no DB needed — and survives relaunches.
+    func manageAlarms(action: String, time: String, label: String, id: String) async -> String {
+        let center = UNUserNotificationCenter.current()
+        let act = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        switch act {
+        case "create":
+            guard let fire = Self.parseAlarmDate(time) else {
+                return "Error: 'time' debe ir en formato \"HH:MM\" o \"YYYY-MM-DD HH:MM\"."
+            }
+            guard fire.timeIntervalSinceNow > 0 else {
+                return "Error: esa hora ya ha pasado; indica una hora futura."
+            }
+            // Ask for notification permission the first time; an alarm is useless
+            // if the system can't deliver it.
+            let granted: Bool = await withCheckedContinuation { cont in
+                UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .sound]) { ok, _ in
+                        cont.resume(returning: ok)
+                    }
+            }
+            let comps = Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute], from: fire)
+            let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+            let content = UNMutableNotificationContent()
+            let name = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            content.title = name.isEmpty ? "⏰ Alarma" : "⏰ \(name)"
+            content.body = name.isEmpty ? "Es la hora." : name
+            content.sound = .default
+            let ident = Self.alarmIDPrefix + UUID().uuidString
+            let req = UNNotificationRequest(identifier: ident, content: content, trigger: trigger)
+            do {
+                try await center.add(req)
+            } catch {
+                return "Error al crear la alarma: \(error.localizedDescription)"
+            }
+            var msg = "Alarma puesta para \(Self.alarmDateFormatter.string(from: fire))"
+            if !name.isEmpty { msg += " («\(name)»)" }
+            msg += " (id: \(ident.dropFirst(Self.alarmIDPrefix.count).prefix(8)))."
+            if !granted {
+                msg += " Aviso: las notificaciones no están autorizadas, así que es posible "
+                    + "que no suene; actívalas en Ajustes › Notificaciones."
+            }
+            return msg
+
+        case "list":
+            let pending = await center.pendingNotificationRequests()
+            let alarms = pending
+                .filter { $0.identifier.hasPrefix(Self.alarmIDPrefix) }
+                .compactMap { req -> (date: Date, line: String)? in
+                    guard let trig = req.trigger as? UNCalendarNotificationTrigger,
+                          let next = trig.nextTriggerDate() else { return nil }
+                    let shortID = req.identifier.dropFirst(Self.alarmIDPrefix.count).prefix(8)
+                    let title = req.content.title.replacingOccurrences(of: "⏰ ", with: "")
+                    return (next, "• \(Self.alarmDateFormatter.string(from: next)) — \(title) "
+                            + "(id: \(shortID))")
+                }
+                .sorted { $0.date < $1.date }
+            if alarms.isEmpty { return "No hay alarmas pendientes." }
+            return "Alarmas pendientes:\n" + alarms.map(\.line).joined(separator: "\n")
+
+        case "delete":
+            let key = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return "Error: falta 'id' para cancelar la alarma." }
+            let pending = await center.pendingNotificationRequests()
+            // Match on the full identifier or the short suffix shown by `list`.
+            let matches = pending.filter {
+                $0.identifier.hasPrefix(Self.alarmIDPrefix) &&
+                ($0.identifier == key
+                 || $0.identifier == Self.alarmIDPrefix + key
+                 || $0.identifier.dropFirst(Self.alarmIDPrefix.count).hasPrefix(key))
+            }
+            guard !matches.isEmpty else {
+                return "No se encontró ninguna alarma con id «\(key)»."
+            }
+            center.removePendingNotificationRequests(
+                withIdentifiers: matches.map(\.identifier))
+            return matches.count == 1 ? "Alarma cancelada."
+                                      : "\(matches.count) alarmas canceladas."
+
+        default:
+            return "Error: acción desconocida «\(action)». Usa create, list o delete."
+        }
+    }
+
+    /// Locale-aware formatter for showing alarm times back to the user.
+    private static let alarmDateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "es_ES")
+        df.dateFormat = "EEEE d 'de' MMMM, HH:mm"
+        return df
+    }()
+
+    /// Parses an alarm time. A bare "HH:MM" means the next time that clock time
+    /// occurs (today if still ahead, otherwise tomorrow); a full
+    /// "YYYY-MM-DD HH:MM" / "YYYY-MM-DD" is taken literally.
+    private static func parseAlarmDate(_ s: String) -> Date? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return nil }
+        for fmt in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.dateFormat = fmt
+            if let d = df.date(from: t) { return d }
+        }
+        if let hm = parseHourMinute(t) {
+            let cal = Calendar.current, now = Date()
+            var comps = cal.dateComponents([.year, .month, .day], from: now)
+            comps.hour = hm.hour; comps.minute = hm.minute; comps.second = 0
+            guard let today = cal.date(from: comps) else { return nil }
+            return today > now ? today : cal.date(byAdding: .day, value: 1, to: today)
+        }
+        return nil
     }
 
     // MARK: - Inbox (questions + notices queued during autonomous runs)
@@ -1210,36 +1366,27 @@ final class AppState: ObservableObject {
     }
 
     private func postInboxNotification(count: Int) {
-        requestNotificationPermission()
-        let center = UNUserNotificationCenter.current()
-        center.setNotificationCategories([
-            UNNotificationCategory(identifier: AppState.questionCategoryID, actions: [],
-                                   intentIdentifiers: [], options: [])
-        ])
         // Tailor the copy to whether it's only questions, only notices, or a mix.
         let questions = inboxItems.filter { $0.kind == .question }.count
         let notices = count - questions
-        let content = UNMutableNotificationContent()
+        let title: String, body: String
         if questions > 0 && notices == 0 {
-            content.title = "Saphire quiere preguntarte algo"
-            content.body = questions == 1
+            title = "Saphire quiere preguntarte algo"
+            body = questions == 1
                 ? "Tienes 1 pregunta pendiente. Ábrela para responder."
                 : "Tienes \(questions) preguntas pendientes. Ábrelas para responder."
         } else if questions == 0 {
-            content.title = "Saphire tiene algo que contarte"
-            content.body = notices == 1
+            title = "Saphire tiene algo que contarte"
+            body = notices == 1
                 ? "Tienes 1 aviso nuevo. Ábrelo para verlo."
                 : "Tienes \(notices) avisos nuevos. Ábrelos para verlos."
         } else {
-            content.title = "Saphire tiene novedades"
-            content.body = "Tienes \(count) cosas pendientes (\(questions) "
+            title = "Saphire tiene novedades"
+            body = "Tienes \(count) cosas pendientes (\(questions) "
                 + "pregunta\(questions == 1 ? "" : "s") y \(notices) "
                 + "aviso\(notices == 1 ? "" : "s")). Ábrelas para verlas."
         }
-        content.sound = .default
-        content.categoryIdentifier = AppState.questionCategoryID
-        center.add(UNNotificationRequest(identifier: UUID().uuidString,
-                                         content: content, trigger: nil))
+        deliverUserAlert(title: title, body: body, opensInbox: true)
     }
 
     var current: Conversation {
@@ -1416,6 +1563,8 @@ final class AppState: ObservableObject {
                 + "manage_reminders para gestionar los recordatorios del Mac (listar, crear, "
                 + "completar y borrar en la app Recordatorios); "
                 + "manage_calendar para consultar y crear eventos en el Calendario del Mac; "
+                + "manage_alarms para poner, listar o cancelar alarmas (avisos con sonido a una "
+                + "hora exacta, p.ej. «despiértame a las 7» o «avísame en 10 minutos»); "
                 + "manage_scheduled_tasks para crear, listar o borrar tareas recurrentes que la "
                 + "propia Saphire ejecutará sola a una hora fija (úsala cuando el usuario pida "
                 + "que recuerdes o automatices algo de forma periódica); "
@@ -1836,6 +1985,7 @@ final class AppState: ObservableObject {
         if runCommandEnabled { t.append(runCommandTool) }
         if remindersEnabled { t.append(manageRemindersTool) }
         if calendarEnabled { t.append(manageCalendarTool) }
+        if alarmsEnabled { t.append(manageAlarmsTool) }
         if scheduleTaskToolEnabled { t.append(manageScheduledTasksTool) }
         if searchFilesEnabled { t.append(searchFilesTool) }
         if watchdogEnabled { t.append(manageWatchersTool) }
@@ -1989,6 +2139,12 @@ final class AppState: ObservableObject {
             } catch {
                 return "Error al gestionar el calendario: \(error.localizedDescription)"
             }
+
+        case "manage_alarms":
+            return await manageAlarms(action: argString("action", call) ?? "",
+                                      time: argString("time", call) ?? "",
+                                      label: argString("label", call) ?? "",
+                                      id: argString("id", call) ?? "")
 
         case "manage_scheduled_tasks":
             return handleScheduledTaskTool(call)
@@ -2204,6 +2360,7 @@ final class AppState: ObservableObject {
         case "run_command":  return "Terminal: \(argString("command", call) ?? "")"
         case "manage_reminders": return "Recordatorios: \(argString("action", call) ?? "")"
         case "manage_calendar": return "Calendario: \(argString("action", call) ?? "")"
+        case "manage_alarms": return "Alarmas: \(argString("action", call) ?? "")"
         case "manage_scheduled_tasks": return "Tareas programadas: \(argString("action", call) ?? "")"
         case "manage_watchers": return "Vigilantes: \(argString("action", call) ?? "")"
         case "search_files": return "Buscando archivos: \(argString("query", call) ?? "")"
@@ -2241,6 +2398,7 @@ final class AppState: ObservableObject {
         case "read_whatsapp": (slug, detail) = ("whatsapp", argString("chat", call) ?? argString("query", call))
         case "manage_reminders": (slug, detail) = ("reminders", argString("action", call))
         case "manage_calendar":  (slug, detail) = ("calendar", argString("action", call))
+        case "manage_alarms":    (slug, detail) = ("alarm", argString("time", call) ?? argString("action", call))
         case "manage_scheduled_tasks": (slug, detail) = ("scheduled_tasks", argString("action", call))
         case "manage_watchers": (slug, detail) = ("watchers", argString("action", call))
         case "search_files":  (slug, detail) = ("search_files", argString("query", call))

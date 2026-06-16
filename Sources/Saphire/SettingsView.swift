@@ -290,6 +290,10 @@ private struct ToolsSettings: View {
                 toolToggle("Calendario (manage_calendar)", isOn: $state.calendarEnabled,
                            help: "Listar y gestionar eventos del Calendario. La primera vez "
                                  + "macOS pedirá permiso.")
+                toolToggle("Alarmas (manage_alarms)", isOn: $state.alarmsEnabled,
+                           help: "Pon, lista y cancela alarmas: avisos con sonido a una hora "
+                                 + "exacta que el sistema lanza aunque Saphire esté inactiva. "
+                                 + "La primera vez macOS pedirá permiso de notificaciones.")
                 toolToggle("Tareas programadas (manage_scheduled_tasks)", isOn: $state.scheduleTaskToolEnabled)
                 toolToggle("Buscar archivos (search_files)", isOn: $state.searchFilesEnabled,
                            help: "Localiza archivos por nombre o contenido con el índice "

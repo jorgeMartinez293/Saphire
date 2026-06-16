@@ -47,9 +47,10 @@ echo "==> Re-signing bundle..."
 # Set SIGN_ID to your own signing identity — the SHA-1 hash or the full name of
 # a certificate from `security find-identity -v -p codesigning`
 # (e.g. "Apple Development: you@example.com (XXXXXXXXXX)"). A free Apple
-# Development certificate from Xcode works. Leave empty to fall back to ad-hoc
-# signing (TCC permissions for WhatsApp/Mail reset on every redeploy).
-SIGN_ID="${SIGN_ID:-}"
+# Development certificate from Xcode works. If the identity below isn't in
+# your keychain it falls back to ad-hoc signing (TCC permissions for
+# WhatsApp/Mail then reset on every redeploy).
+SIGN_ID="${SIGN_ID:-D72154447EFEFC72E60A726073A4CBBDCCC1DAB1}"
 if [ -n "$SIGN_ID" ] && security find-identity -v -p codesigning | grep -q "$SIGN_ID"; then
     codesign --force --deep --sign "$SIGN_ID" "$APP"
 else

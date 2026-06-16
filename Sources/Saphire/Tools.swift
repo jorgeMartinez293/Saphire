@@ -419,6 +419,39 @@ let manageCalendarTool = ToolSpec.function(
     required: ["action"]
 )
 
+/// Sets, lists, and cancels one-shot alarms on the Mac. An alarm is a local
+/// notification (banner + sound) that the system fires at the chosen time, even
+/// if Saphire is idle. Unlike `manage_reminders` (a to-do in Reminders.app) an
+/// alarm is meant to grab attention at an exact moment ("despiértame a las 7",
+/// "avísame dentro de 10 minutos").
+let manageAlarmsTool = ToolSpec.function(
+    name: "manage_alarms",
+    description: "Pone, lista y cancela alarmas en el Mac. Una alarma es un aviso "
+        + "(notificación con sonido) que el sistema lanza a una hora exacta, aunque "
+        + "Saphire esté inactiva. Úsala cuando el usuario pida que le avises o le "
+        + "despiertes a una hora concreta o dentro de un rato («pon una alarma a las "
+        + "7:30», «avísame en 20 minutos»). Para un recordatorio/tarea (no un aviso "
+        + "puntual con sonido) usa manage_reminders. Acciones: 'create' para poner una "
+        + "alarma, 'list' para ver las pendientes, 'delete' para cancelar una por su id "
+        + "(el que devuelve 'list'). Para horas relativas («dentro de 10 minutos») llama "
+        + "antes a get_datetime y calcula la hora absoluta.",
+    properties: [
+        "action": .init(type: "string", description: "Acción a realizar.",
+                        enumValues: ["create", "list", "delete"]),
+        "time": .init(type: "string",
+                      description: "Hora de la alarma (solo create). Formato \"HH:MM\" "
+                          + "(la próxima vez que ocurra esa hora, hoy o mañana) o "
+                          + "\"YYYY-MM-DD HH:MM\" para una fecha y hora concretas."),
+        "label": .init(type: "string",
+                       description: "Texto opcional de la alarma (solo create), p.ej. "
+                           + "«Reunión» o «Sacar la pizza del horno»."),
+        "id": .init(type: "string",
+                    description: "Identificador de la alarma a cancelar (solo delete); "
+                        + "es el id que muestra 'list'.")
+    ],
+    required: ["action"]
+)
+
 /// Drives Calendar.app with AppleScript to list events in a range or create one.
 /// Dates are parsed in Swift and passed as integer components so AppleScript can
 /// build a proper `date` object regardless of the system locale.
